@@ -1,0 +1,13 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# Rendered output
+*_files/
+*.html
+*.pdf
+*.knit.md
+
+# Backups
+*-backup.qmd

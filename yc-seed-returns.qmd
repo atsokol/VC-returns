@@ -1,0 +1,337 @@
+---
+title: "YC Seed Returns with Batch Effects"
+format:
+  html: default
+  pdf: default
+execute:
+  echo: false
+  warning: false
+  message: false
+params:
+  sims: 10000
+  n_deals: 20
+  seed: 42
+---
+
+```{r}
+#| label: setup
+library(tidyverse)
+```
+
+## Overview
+
+This notebook models returns for seed-stage investments in YC Demo Day funds, incorporating **batch-quality effects** — the observation that some YC batches produce dramatically better outcomes than others.
+
+From [AngelList Demo Day Fund](https://www.angellist.com/demo-day-funds) data (net MOICs for mature batches 2016–2020):
+
+| Batch | MOIC | Quartile |
+|-------|------|----------|
+| W16 | 8.55x | Top 10% |
+| S16 | 0.53x | Bottom 10% |
+| W17 | 5.42x | Top 10% |
+| S17 | 3.70x | Top 10% |
+| W18 | 9.92x | Top 10% |
+| S18 | 2.90x | Top 25% |
+| W19 | 11.63x | Top 10% |
+| S19 | 2.12x | Top 25% |
+| W20 | 1.80x | Top 25% |
+| S20 | 4.93x | Top 10% |
+
+The wide spread (0.53x to 11.63x) reflects batch-to-batch variation driven by market conditions, cohort composition, and luck in catching outlier companies. We model this as a **batch quality multiplier** that scales the deal-level distribution.
+
+*Disclaimer: Past performance is not a guarantee of future returns. This analysis is based on historical data and model assumptions.*
+
+**Key takeaway: batch diversification matters.** Investing in a single batch carries ~10% probability of returning less than invested capital P(<1x) despite the strong expected return (~5x). Spreading capital across 4+ batches (20 deals each) significantly reduces loss risk, pushes the median toward the mean, and raises the probability of realising 2x-5x returns — without changing expected return.
+
+### Baseline deal distribution
+
+The deal-level return distribution is derived from publicly available data on YC seed-stage outcomes:
+
+- **[Jared Heyman / Rebel Fund analysis](https://jaredheyman.medium.com/on-the-176-annual-return-of-a-yc-startup-index-cf4ba8ebef19)** — ~5–6% of YC startups become unicorns; top companies (Airbnb, Stripe, etc.) produce >1,000x seed-stage returns; outcomes follow a steep power law where a handful of deals drive the overwhelming majority of returns
+- **[Lenny's Newsletter / Palle Broe deep dive](https://www.lennysnewsletter.com/p/pulling-back-the-curtain-on-the-magic)** — across 4,939 YC companies: only 13% have gone out of business, ~45% raise a Series A (vs 33% average), 4–5% become unicorns (vs 2.5% average), top 4 companies account for >84% of total market value created
+
+The baseline probabilities below represent a median-quality YC batch. Batch quality shifts this distribution up or down.
+
+```{r}
+#| label: baseline-distribution
+
+# Assumed distribution of deal-level MOICs before fees
+bins_seed <- tibble(
+  lo   = c(0.0,  0.1, 0.5, 1.0,  2.0,  3.0,  5.0,  10.0, 20.0,  50.0, 100.0),
+  hi   = c(0.0,  0.5, 1.0, 2.0,  3.0,  5.0,  10.0, 20.0, 50.0, 100.0, 500.0),
+  prob = c(0.13, 0.12, 0.15, 0.25, 0.12, 0.08, 0.06, 0.04, 0.03, 0.015, 0.005)
+)
+
+pbins_seed <- bins_seed |>
+  mutate(
+    prob = prob / sum(prob),
+    cdf = cumsum(prob)
+  )
+```
+
+```{r}
+#| label: fig-baseline-distribution
+#| fig-cap: "Baseline deal-level return distribution (median-quality batch)"
+
+bins_seed |>
+  mutate(
+    bucket = ifelse(lo == 0 & hi == 0, "Total\nloss",
+                    paste0(lo, "–", hi, "x")),
+
+    bucket = fct_inorder(bucket)
+  ) |>
+  ggplot(aes(x = bucket, y = prob)) +
+  geom_col(fill = "steelblue", width = 0.7) +
+  geom_text(aes(label = scales::label_percent(accuracy = 0.1)(prob)),
+            vjust = -0.5, size = 3) +
+  scale_y_continuous(labels = scales::label_percent(), expand = expansion(mult = c(0, 0.15))) +
+  labs(x = "MOIC bucket", y = "Probability") +
+  theme_minimal()
+```
+
+### Fee structure
+
+Toloka seed fee structure: 8.5% upfront fee, 20% carry, 0% hurdle rate.
+
+```{r}
+#| label: model-params
+
+sims <- params$sims
+n_deals <- params$n_deals
+set.seed(params$seed)
+
+batch_sigma <- 0.7
+
+ddf_moics <- c(8.55, 0.53, 5.42, 3.70, 9.92, 2.90, 11.63, 2.12, 1.80, 4.93)
+
+fees_seed <- list(
+  entry = 0.085,
+  processing = 0,
+  carry = 0.20,
+  hurdle = 0.00
+)
+
+batch_quantiles <- tibble(
+  scenario = c("Bottom 10%", "Bottom 25%", "Median",
+               "Top 25%", "Top 10%"),
+
+  percentile = c(0.10, 0.25, 0.50, 0.75, 0.90),
+  q = qlnorm(percentile, meanlog = 0, sdlog = batch_sigma)
+)
+```
+
+```{r}
+#| label: helpers
+
+# Sample a single deal MOIC from the binned distribution, scaled by batch quality q.
+# Within each bin, MOICs are drawn log-uniformly between lo and hi.
+sample_deal_seed <- function(pbins, q) {
+  u <- runif(1)
+  bin_idx <- min(which(pbins$cdf >= u))
+  lo <- pbins$lo[bin_idx]
+  hi <- pbins$hi[bin_idx]
+  if (lo == 0 && hi == 0) return(0)
+  # Log-uniform sample within bin — gives equal weight per order of magnitude
+  raw <- if (lo == hi) lo else exp(log(lo) + runif(1) * (log(hi) - log(lo)))
+  raw * q # batch quality multiplier
+}
+
+# Compute net portfolio MOIC after entry fees and deal-level carry.
+# Each deal's profit above hurdle is taxed independently; total is divided by paid-in capital.
+apply_fees_seed <- function(deal_moics, fee) {
+  paid_in <- 1 * (1 + fee$entry + fee$processing)
+  net_values <- vapply(deal_moics, function(gross) {
+    profit <- max(gross - 1, 0)
+    excess <- max(profit - fee$hurdle, 0) # profit from which carry is paid
+    carry_fee <- fee$carry * excess
+    gross - carry_fee
+  }, numeric(1))
+  sum(net_values) / (paid_in * length(deal_moics))
+}
+```
+
+## Simulation results
+
+For each batch quality tier, we run `r format(sims, big.mark = ",")` simulations of a `r n_deals`-deal portfolio with the quality multiplier fixed at the corresponding percentile. The "Random batch" row draws batch quality randomly from the log-normal distribution each simulation, representing the unconditional outcome. All values are net MOICs (multiples on invested capital, after fees).
+
+```{r}
+#| label: fixed-batch-simulation
+
+simulate_fixed_batch <- function(q, pbins, n_deals, sims, fee) {
+  net <- numeric(sims)
+  for (s in seq_len(sims)) {
+    deals <- vapply(seq_len(n_deals), \(k) sample_deal_seed(pbins, q), numeric(1))
+    net[s] <- apply_fees_seed(deals, fee)
+  }
+  net
+}
+
+fixed_results <- pmap(batch_quantiles, function(scenario, percentile, q) {
+  net <- simulate_fixed_batch(q, pbins_seed, n_deals, sims, fees_seed)
+  tibble(scenario = scenario, q = q, net = list(net))
+}) |>
+  list_rbind()
+
+# Random batch: simulate 1-batch diversification (q drawn from log-normal each sim)
+# This is also used in the diversification section as the 1-batch case
+simulate_multi_batch <- function(n_batches, deals_per_batch, sims, pbins, sigma, fee) {
+  n_deals_total <- n_batches * deals_per_batch
+  net <- numeric(sims)
+  for (s in seq_len(sims)) {
+    deals <- numeric(n_deals_total)
+    idx <- 1
+    for (b in seq_len(n_batches)) {
+      qb <- rlnorm(1, meanlog = 0, sdlog = sigma)
+      for (k in seq_len(deals_per_batch)) {
+        deals[idx] <- sample_deal_seed(pbins, qb)
+        idx <- idx + 1
+      }
+    }
+    net[s] <- apply_fees_seed(deals, fee)
+  }
+  net
+}
+
+batch_counts <- c(1, 2, 4, 8, 12)
+batch_nets <- map(batch_counts, \(nb) {
+  simulate_multi_batch(nb, n_deals, sims, pbins_seed, batch_sigma, fees_seed)
+}) |>
+  set_names(batch_counts)
+
+fixed_results <- bind_rows(
+  fixed_results,
+  tibble(scenario = "Random batch", q = NA_real_, net = list(batch_nets[["1"]]))
+)
+```
+
+```{r}
+#| label: simulation-summary-table
+
+sim_summary <- fixed_results |>
+  pmap(\(scenario, q, net) {
+    qs <- quantile(net, probs = c(0.10, 0.25, 0.50, 0.75, 0.90))
+    tibble(
+      `Batch quality` = scenario,
+      Mean     = mean(net),
+      Median   = qs[3],
+      `10th %` = qs[1],
+      `25th %` = qs[2],
+      `75th %` = qs[4],
+      `90th %` = qs[5],
+      `P(<1x)` = mean(net < 1.0),
+      `P(>2x)` = mean(net > 2.0),
+      `P(>5x)` = mean(net > 5.0)
+    )
+  }) |>
+  list_rbind()
+
+knitr::kable(sim_summary, digits = 2)
+```
+
+## Diversification across batches
+
+Investing across multiple batches diversifies away batch-quality risk. Each batch contains `r n_deals` deals, so more batches means more total capital deployed — but also more independent draws of batch quality. All values are net MOICs.
+
+```{r}
+#| label: multi-batch-table
+
+multi_batch_summary <- tibble(
+  Batches = batch_counts,
+  `Total deals` = Batches * n_deals,
+  `Median net` = map_dbl(batch_nets, median),
+  `Mean net` = map_dbl(batch_nets, mean),
+  `P(<1x)` = map_dbl(batch_nets, \(x) mean(x < 1)),
+  `P(>2x)` = map_dbl(batch_nets, \(x) mean(x > 2)),
+  `P(>5x)` = map_dbl(batch_nets, \(x) mean(x > 5))
+)
+
+knitr::kable(multi_batch_summary, digits = 2)
+```
+
+The mean return is unchanged (~5.3x) regardless of how many batches you invest in — diversification doesn't change expected return. But the distribution tightens dramatically:
+
+- **The probability of returning less than invested capital P(<1x) virtually vanishes** by 4 batches
+- **Median climbs toward the mean** as variance drops
+- **P(>2x)** goes from ~68% to near-certainty
+- **P(>5x)** increases from ~31% to ~46%
+
+```{r}
+#| label: fig-multi-batch-density
+#| fig-cap: "Net MOIC density by number of batches (20 deals per batch)"
+
+batch_comp <- imap(batch_nets, \(x, nm) tibble(x = x, strategy = paste(nm, ifelse(nm == "1", "batch", "batches")))) |>
+  list_rbind() |>
+  mutate(strategy = fct_inorder(strategy))
+
+ggplot(batch_comp, aes(x = x, colour = strategy, fill = strategy)) +
+  geom_density(alpha = 0.08) +
+  geom_vline(xintercept = 1, linetype = "dashed", alpha = 0.5) +
+  coord_cartesian(xlim = c(0, quantile(batch_comp$x, 0.98))) +
+  labs(x = "Multiple (x)", y = "Density", colour = NULL, fill = NULL) +
+  theme_minimal()
+```
+
+## Appendix: Batch quality model
+
+We model the batch effect as a **log-normal multiplier** applied to each deal's gross MOIC within a batch. A batch quality factor $q$ is drawn once per batch:
+
+$$q \sim \text{LogNormal}(\mu = 0, \sigma)$$
+
+so the median batch has $q = 1$ (no shift), while better/worse batches scale outcomes up/down. The parameter $\sigma$ controls the spread of batch quality.
+
+We calibrate $\sigma$ to approximately reproduce the observed batch-to-batch MOIC spread in the AngelList DDF data. The log standard deviation of the mature batch MOICs is `r round(sd(log(ddf_moics)), 2)`. However, this reflects both batch effects *and* within-batch sampling noise. The pure batch effect $\sigma$ should be somewhat smaller. We use $\sigma = 0.7$ as a reasonable estimate.
+
+```{r}
+#| label: batch-quality-quantiles
+
+knitr::kable(batch_quantiles, digits = 2,
+             col.names = c("Batch quality", "Percentile", "Quality multiplier (q)"))
+```
+
+### Comparison with AngelList DDF actuals
+
+```{r}
+#| label: random-batch-for-validation
+
+random_net <- numeric(sims)
+for (s in seq_len(sims)) {
+  q <- rlnorm(1, meanlog = 0, sdlog = batch_sigma)
+  deals <- vapply(seq_len(n_deals), \(k) sample_deal_seed(pbins_seed, q), numeric(1))
+  random_net[s] <- apply_fees_seed(deals, fees_seed)
+}
+```
+
+```{r}
+#| label: fig-sim-vs-actual
+#| fig-cap: "Simulated net portfolio MOIC percentiles vs actual DDF batch MOICs"
+
+sim_pctiles <- quantile(random_net, probs = seq(0.05, 0.95, by = 0.05))
+sim_pctile_df <- tibble(
+  percentile = seq(0.05, 0.95, by = 0.05),
+  sim_moic = unname(sim_pctiles)
+)
+
+ddf_actual <- tibble(
+  batch = c("W16","S16","W17","S17","W18","S18","W19","S19","W20","S20"),
+  moic = c(8.55, 0.53, 5.42, 3.70, 9.92, 2.90, 11.63, 2.12, 1.80, 4.93)
+) |>
+  arrange(moic) |>
+  mutate(percentile = (row_number() - 0.5) / n())
+
+ggplot() +
+  geom_line(data = sim_pctile_df, aes(x = percentile, y = sim_moic),
+            colour = "steelblue", linewidth = 1) +
+  geom_point(data = ddf_actual, aes(x = percentile, y = moic),
+             colour = "darkorange", size = 3) +
+  geom_text(data = ddf_actual, aes(x = percentile, y = moic, label = batch),
+            vjust = -0.8, size = 3) +
+  geom_hline(yintercept = 1, linetype = "dashed", alpha = 0.5) +
+  scale_y_continuous(trans = "pseudo_log", breaks = c(0, 0.5, 1, 2, 3, 5, 10, 15)) +
+  scale_x_continuous(labels = scales::label_percent()) +
+  labs(
+    x = "Percentile",
+    y = "Portfolio MOIC (x)",
+    title = "Simulated percentiles (blue) vs actual DDF batches (orange)"
+  ) +
+  theme_minimal()
+```
