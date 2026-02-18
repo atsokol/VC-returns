@@ -11,11 +11,20 @@ params:
   sims: 10000
   n_deals: 20
   seed: 42
+  horizon_years: 12          # horizon for DPI/TVPI/IRR
+  mark_haircut_mode: "base"  # base / conservative / stress
+  sigma_grid: [0.4, 0.7, 1.0]# sensitivity grid for batch_sigma
+  exit_model: "yc_public"    # yc_public / generic_vc
+  discount_rate: 0.0         # used only in NPV/IRR helpers (kept for completeness)
 ---
 
 ```{r}
 #| label: setup
 library(tidyverse)
+library(scales)
+library(glue)
+library(purrr)
+library(tidyr)
 ```
 
 ## Overview
@@ -93,14 +102,110 @@ bins_seed |>
 
 Toloka seed fee structure: 8.5% upfront fee, 20% carry, 0% hurdle rate.
 
+## Timeline model: DPI vs TVPI
+
+This notebook’s original Monte Carlo reports a **single net MOIC** distribution. In venture, that hides a crucial dimension: **timing**.
+
+- **DPI (Distributions / Paid-In)**: realized cash returned by time \(T\). DPI is the cleanest measure of liquidity, but it will look “too low” early because the best exits tend to take the longest.
+- **TVPI (Total Value / Paid-In)**: cash returned + remaining (unrealized) value (“marks”) at time \(T\).
+- **Conservative TVPI**: TVPI after applying an explicit haircut to private marks, motivated by secondary-market pricing and stale valuation marks.
+
+### Desk-research anchors (public, with explicit limitations)
+
+**Time-to-outcome (YC-specific anchors used for the base timeline model):**
+
+- Jared Heyman (Rebel Fund) analyzes \~250 “real” YC exits (excluding tiny outcomes) and reports a **median time to exit \~4 years**; **\<$100M exits \~3 years**, **$100M–$999M exits \~6 years**, **$1B+ exits “nearly a decade”**. He also notes the **median exit dollar takes \~9 years**, and that **\~90% of exits occur in \(\le\) 9 years** but those represent only \~50% of exit dollars. Source: `https://jaredheyman.medium.com/on-yc-startup-exits-2025-update-c6017e8e526e`
+- As additional context (older sample, large-tech-exits focus), CB Insights finds the **top 100 US VC-backed tech exits (since 2009 in their sample)** took **6.3 years median** from first financing to IPO/M&A exit. Source: `https://www.cbinsights.com/research/venture-time-exit-marathon/` (note: sample ends 2014; used only as a generic VC sanity-check anchor).
+- For IPO timing context, Jay Ritter’s VC-backed IPO statistics show **median age at IPO** is often around a decade-plus in recent years (e.g. **2025: 12 years**, **2024: 14 years**; “age” = IPO year minus founding year). Source: `https://site.warrington.ufl.edu/ritter/files/IPOs-VC-backed.pdf` (Table 4).
+
+**Marks / staleness / secondary discounts (for conservative TVPI haircuts):**
+
+- PitchBook/NVCA Venture Monitor (Q4 2025) highlights that **41% of unicorns have not raised since at least 2022**, consistent with stale “last round” marks in parts of the private market. Source (NVCA page + PDF): `https://nvca.org/pitchbook-nvca-venture-monitor` and `https://nvca.org/wp-content/uploads/2026/01/q4-2025-pitchbook-nvca-venture-monitor.pdf`
+- VC Corner (Aug 2025) summarizes secondary pricing: “**average discount** for venture assets has narrowed to **~75% of NAV in 2025**, up from the **high 60s in 2023**”, and also notes that in 2024 many portfolios changed hands at **40–60% discounts** to NAV. Source: `https://www.thevccorner.com/p/vc-secondary-market` (newsletter-style source; directionally useful but not an official index).
+- Forge (Oct 2024) reports secondary pricing **discount to last funding round** hitting **-52% (July 2023)** and bottoming at **-62% (Sept 2023)**, later improving to **-8% (Aug 2024)** and **-12% (Sept 2024)**. Source: `https://forgeglobal.com/insights/reports/has-the-great-reset-run-its-course/` (note: discount is to last round, not to NAV; used as an anchor for “stress” mark uncertainty ranges).
+- Axios (Feb 2026) is paywalled; public summaries cite PitchBook estimating **25%+ of unicorns are “undercorns”**. Source: `http://www.techmeme.com/260213/p14` (limitation: summary, not the full Axios text).
+
+### Model choice
+
+We keep the original **power-law deal outcome proxy** (`bins_seed`) for final multiples, but add a **time-to-event layer**:
+
+- Each deal draws a final outcome multiple \(M_{\text{final}}\) (as before, with a batch-quality multiplier).
+- We map that outcome to an outcome type (dead / small / medium / big / unicorn), then draw a **time to outcome** \(t\).
+- Before \(t\), we generate **stale/smoothed marks** via an S-curve trajectory from ~1x toward \(M_{\text{final}}\), then apply an explicit **mark haircut** (base / conservative / stress).
+
+This allows apples-to-apples comparisons:
+
+- **DPI(T)** uses only realized cash by time \(T\).
+- **TVPI(T)** uses realized cash + marked value of still-alive deals at \(T\).
+
+```{r}
+#| label: timeline-params
+
+horizon_years <- params$horizon_years
+mark_haircut_mode <- params$mark_haircut_mode
+exit_model <- params$exit_model
+discount_rate <- params$discount_rate
+
+haircut_map <- c(base = 0.75, conservative = 0.65, stress = 0.50)
+mark_haircut <- unname(haircut_map[[mark_haircut_mode]])
+
+# Mark dynamics: S-curve + exponential smoothing (staleness)
+mark_params <- list(
+  haircut = mark_haircut,
+  sigmoid_k = 9,        # steeper -> more back-loaded value creation (assumption; stress-tested in sensitivity)
+  sigmoid_shift = 6,    # larger -> more of the move happens late (assumption)
+  smooth_alpha = 0.35   # 0..1; lower => staler/smoother marks (assumption)
+)
+
+# Exit / outcome timing parameters.
+# Where numbers are anchored in sources, we cite them in text above; remaining values are explicit assumptions.
+exit_params <- switch(
+  exit_model,
+  yc_public = list(
+    # Anchors: Heyman (2025 update) — small ~3y, mid ~6y, $1B+ ~ ~10y; median exit dollar ~9y
+    medians = c(
+      dead = 2.5,          # assumption (see CB Insights RIP report for "lemons ripen early" timing context)
+      exit_small = 3.0,
+      exit_medium = 6.0,
+      exit_big = 9.0,      # anchored to "median exit dollar ~9 years" as a value-weighted proxy
+      unicorn = 10.0
+    ),
+    sigmas = c(
+      dead = 0.60,
+      exit_small = 0.55,
+      exit_medium = 0.55,
+      exit_big = 0.50,
+      unicorn = 0.45
+    )
+  ),
+  generic_vc = list(
+    # Generic VC timing sanity-check model. Anchors: CB Insights median ~6.3y for top 100 exits (older sample),
+    # Ritter: VC-backed IPO median age often ~10-14y from founding (not from seed).
+    medians = c(
+      dead = 2.5,          # assumption
+      exit_small = 4.0,    # assumption
+      exit_medium = 6.5,   # anchored loosely to CB Insights median for large exits
+      exit_big = 8.5,      # assumption
+      unicorn = 11.0       # assumption, consistent with IPO ages being ~10y+
+    ),
+    sigmas = c(
+      dead = 0.60,
+      exit_small = 0.60,
+      exit_medium = 0.55,
+      exit_big = 0.50,
+      unicorn = 0.45
+    )
+  ),
+  stop("Unknown exit_model. Use 'yc_public' or 'generic_vc'.")
+)
+```
+
 ```{r}
 #| label: model-params
 
 sims <- params$sims
 n_deals <- params$n_deals
 set.seed(params$seed)
-
-batch_sigma <- 0.7
 
 ddf_moics <- c(8.55, 0.53, 5.42, 3.70, 9.92, 2.90, 11.63, 2.12, 1.80, 4.93)
 
@@ -111,13 +216,8 @@ fees_seed <- list(
   hurdle = 0.00
 )
 
-batch_quantiles <- tibble(
-  scenario = c("Bottom 10%", "Bottom 25%", "Median",
-               "Top 25%", "Top 10%"),
-
-  percentile = c(0.10, 0.25, 0.50, 0.75, 0.90),
-  q = qlnorm(percentile, meanlog = 0, sdlog = batch_sigma)
-)
+# Sensitivity grid (also reused in calibration and robustness tables)
+sigma_grid <- params$sigma_grid
 ```
 
 ```{r}
@@ -148,6 +248,184 @@ apply_fees_seed <- function(deal_moics, fee) {
   }, numeric(1))
   sum(net_values) / (paid_in * length(deal_moics))
 }
+
+# Fund-level carry (closer to real fund math than per-deal).
+# Applies carry to *total* profit, then divides by paid-in (including entry fee).
+apply_fees_fund_level <- function(gross_values, fee) {
+  paid_in <- 1 * (1 + fee$entry + fee$processing)
+  contributed <- 1 # carry is typically on contributed capital, not on entry fee
+  gross_total <- sum(gross_values)
+  profit_total <- max(gross_total - contributed * length(gross_values) * (1 + fee$hurdle), 0)
+  carry_fee <- fee$carry * profit_total
+  net_total <- gross_total - carry_fee
+  net_total / (paid_in * length(gross_values))
+}
+
+assign_outcome_bucket <- function(deal_moic) {
+  if (deal_moic <= 0) return("dead")
+  if (deal_moic < 3) return("exit_small")
+  if (deal_moic < 10) return("exit_medium")
+  if (deal_moic < 50) return("exit_big")
+  "unicorn"
+}
+
+sample_event_time <- function(outcome_type, exit_params) {
+  med <- exit_params$medians[[outcome_type]]
+  sdlog <- exit_params$sigmas[[outcome_type]]
+  rlnorm(1, meanlog = log(med), sdlog = sdlog)
+}
+
+sigmoid <- function(x) 1 / (1 + exp(-x))
+
+mark_trajectory <- function(M_final, t_event, horizon_years, mark_params) {
+  years <- 0:horizon_years
+  t_event <- max(t_event, 1e-6)
+
+  # S-curve in "progress space" so that:
+  # - M(0) = 1
+  # - M(t_event) = M_final
+  x <- (years / t_event) * mark_params$sigmoid_k - mark_params$sigmoid_shift
+  s <- sigmoid(x)
+  s0 <- sigmoid(-mark_params$sigmoid_shift)
+  s1 <- sigmoid(mark_params$sigmoid_k - mark_params$sigmoid_shift)
+  s_adj <- (s - s0) / (s1 - s0)
+  s_adj <- pmin(pmax(s_adj, 0), 1)
+
+  M_true <- 1 + (M_final - 1) * s_adj
+
+  # Staleness / smoothing proxy via EWMA on marks.
+  alpha <- mark_params$smooth_alpha
+  M_smooth <- M_true
+  for (i in 2:length(M_smooth)) {
+    M_smooth[i] <- alpha * M_true[i] + (1 - alpha) * M_smooth[i - 1]
+  }
+
+  # Apply haircut to unrealized marks (pre-event).
+  # Note: after event the deal is assumed converted into cash, so mark -> 0 (handled in simulator).
+  M_smooth * mark_params$haircut
+}
+```
+
+```{r}
+#| label: calibration-sigma
+
+# Calibration goal:
+# Observed AngelList DDF batch MOICs reflect (i) true batch effect dispersion, (ii) within-batch sampling noise,
+# plus (iii) vehicle/marking/measurement noise (proxy here as multiplicative lognormal noise).
+#
+# We calibrate batch_sigma by simulating batch portfolios and matching the distribution of batch MOICs.
+
+set.seed(params$seed + 1)
+
+simulate_one_batch_moic <- function(pbins, n_deals, sigma_batch, fee, sigma_meas = 0, carry_mode = c("per_deal", "whole_fund")) {
+  carry_mode <- match.arg(carry_mode)
+  q <- rlnorm(1, meanlog = 0, sdlog = sigma_batch)
+  deals <- vapply(seq_len(n_deals), \(k) sample_deal_seed(pbins, q), numeric(1))
+
+  moic <- if (carry_mode == "per_deal") {
+    apply_fees_seed(deals, fee)
+  } else {
+    apply_fees_fund_level(deals, fee)
+  }
+
+  # Measurement / vehicle noise (proxy): observed = true * noise
+  moic * rlnorm(1, meanlog = 0, sdlog = sigma_meas)
+}
+
+calibrate_batch_sigma <- function(ddf_moics, pbins, n_deals, fee,
+                                  sigma_candidates,
+                                  sigma_meas_grid = c(0, 0.10, 0.20, 0.30, 0.40),
+                                  sims_cal = 6000,
+                                  carry_mode = "per_deal") {
+  probs <- seq(0.05, 0.95, by = 0.05)
+  target_q <- quantile(ddf_moics, probs = probs, type = 8, names = FALSE)
+  target_logq <- log(pmax(target_q, 1e-6))
+
+  grid <- tidyr::crossing(
+    sigma_batch = sigma_candidates,
+    sigma_meas = sigma_meas_grid
+  )
+
+  scored <- grid |>
+    mutate(
+      sim_logq = pmap(list(sigma_batch, sigma_meas), \(sb, sm) {
+        sims <- vapply(seq_len(sims_cal), \(i) simulate_one_batch_moic(pbins, n_deals, sb, fee, sm, carry_mode), numeric(1))
+        log(quantile(sims, probs = probs, type = 8, names = FALSE))
+      }),
+      distance = map_dbl(sim_logq, \(x) mean((x - target_logq)^2))
+    ) |>
+    arrange(distance)
+
+  best <- scored[1, ]
+  list(best = best, scored = scored, probs = probs, target_q = target_q)
+}
+
+cal <- calibrate_batch_sigma(
+  ddf_moics = ddf_moics,
+  pbins = pbins_seed,
+  n_deals = n_deals,
+  fee = fees_seed,
+  sigma_candidates = sigma_grid,
+  sigma_meas_grid = c(0, 0.10, 0.20, 0.30, 0.40),
+  sims_cal = 6000,
+  carry_mode = "per_deal"
+)
+
+batch_sigma <- cal$best$sigma_batch[[1]]
+sigma_meas_hat <- cal$best$sigma_meas[[1]]
+
+batch_quantiles <- tibble(
+  scenario = c("Bottom 10%", "Bottom 25%", "Median",
+               "Top 25%", "Top 10%"),
+  percentile = c(0.10, 0.25, 0.50, 0.75, 0.90),
+  q = qlnorm(percentile, meanlog = 0, sdlog = batch_sigma)
+)
+
+cal_table <- cal$scored |>
+  mutate(distance = signif(distance, 4)) |>
+  select(sigma_batch, sigma_meas, distance)
+
+knitr::kable(
+  cal_table,
+  caption = glue("Calibration grid (lower distance is better). Selected: batch_sigma={round(batch_sigma,2)}, sigma_meas={round(sigma_meas_hat,2)}")
+)
+```
+
+```{r}
+#| label: fig-calibration-sigma
+#| fig-cap: "Calibration: DDF batch MOICs vs simulated quantile curves across sigma candidates (with best-fit measurement noise per sigma)"
+
+probs_line <- seq(0.05, 0.95, by = 0.05)
+ddf_actual <- tibble(
+  batch = c("W16","S16","W17","S17","W18","S18","W19","S19","W20","S20"),
+  moic = ddf_moics
+) |>
+  arrange(moic) |>
+  mutate(percentile = (row_number() - 0.5) / n())
+
+best_meas_by_sigma <- cal$scored |>
+  group_by(sigma_batch) |>
+  slice_min(order_by = distance, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+sim_lines <- best_meas_by_sigma |>
+  mutate(sim_q = pmap(list(sigma_batch, sigma_meas), \(sb, sm) {
+    sims <- vapply(seq_len(8000), \(i) simulate_one_batch_moic(pbins_seed, n_deals, sb, fees_seed, sm, "per_deal"), numeric(1))
+    tibble(percentile = probs_line, sim_moic = unname(quantile(sims, probs = probs_line, type = 8)))
+  })) |>
+  select(sigma_batch, sigma_meas, sim_q) |>
+  unnest(sim_q) |>
+  mutate(label = glue("sigma={sigma_batch}, meas={sigma_meas}"))
+
+ggplot() +
+  geom_line(data = sim_lines, aes(x = percentile, y = sim_moic, colour = label), linewidth = 1) +
+  geom_point(data = ddf_actual, aes(x = percentile, y = moic), colour = "darkorange", size = 3) +
+  geom_text(data = ddf_actual, aes(x = percentile, y = moic, label = batch), vjust = -0.8, size = 3) +
+  geom_hline(yintercept = 1, linetype = "dashed", alpha = 0.5) +
+  scale_y_continuous(trans = "pseudo_log", breaks = c(0, 0.5, 1, 2, 3, 5, 10, 15)) +
+  scale_x_continuous(labels = scales::label_percent()) +
+  labs(x = "Percentile", y = "Portfolio MOIC (x)", colour = NULL) +
+  theme_minimal()
 ```
 
 ## Simulation results
@@ -271,6 +549,337 @@ ggplot(batch_comp, aes(x = x, colour = strategy, fill = strategy)) +
   theme_minimal()
 ```
 
+## Timeline simulation: DPI vs TVPI over time
+
+The batch MOIC tables above collapse all cashflows into a single horizonless multiple. Below we simulate a **time path** for each deal and report:
+
+- **DPI(T)** (exits-only) trajectory
+- **TVPI(T)** (exits + marks) trajectory under a chosen mark haircut mode (`r mark_haircut_mode`, haircut = `r percent(mark_haircut)`)
+- **Realized fraction** (share of deals that have produced cash by time \(T\))
+- A simple **IRR** approximation using annual cashflows (cash exits, plus terminal marks at the horizon for “TVPI-IRR”)
+
+```{r}
+#| label: simulate-timeline
+
+year_index_from_time <- function(t_years) pmax(1L, as.integer(ceiling(t_years)))
+
+irr_from_cashflows <- function(cfs) {
+  # cfs: numeric vector at integer years 0..T
+  npv <- function(r) sum(cfs / (1 + r)^(0:(length(cfs) - 1)))
+  if (all(cfs >= 0) || all(cfs <= 0)) return(NA_real_)
+  # Search a wide bracket; handle failures gracefully
+  tryCatch(
+    uniroot(function(r) npv(r), interval = c(-0.99, 10), tol = 1e-7)$root,
+    error = function(e) NA_real_
+  )
+}
+
+simulate_multi_batch_timeline <- function(n_batches, deals_per_batch, sims,
+                                         pbins, batch_sigma, fee,
+                                         horizon_years,
+                                         exit_params, mark_params,
+                                         carry_mode = c("per_deal", "whole_fund")) {
+  carry_mode <- match.arg(carry_mode)
+  n_deals_total <- n_batches * deals_per_batch
+
+  # Store trajectories as matrices: sims x (horizon_years+1)
+  dpi <- matrix(NA_real_, nrow = sims, ncol = horizon_years + 1)
+  tvpi <- matrix(NA_real_, nrow = sims, ncol = horizon_years + 1)
+  realized_fraction <- matrix(NA_real_, nrow = sims, ncol = horizon_years + 1)
+
+  irr_dpi <- numeric(sims)
+  irr_tvpi <- numeric(sims)
+
+  exit_counts <- vector("list", sims)
+
+  paid_in_total <- n_deals_total * (1 + fee$entry + fee$processing)
+  contributed_total <- n_deals_total * 1
+
+  for (s in seq_len(sims)) {
+    # Simulate all deals with batch effects.
+    deal_types <- character(n_deals_total)
+    t_event <- numeric(n_deals_total)
+    M_final <- numeric(n_deals_total)
+    y_event <- integer(n_deals_total)
+
+    idx <- 1
+    for (b in seq_len(n_batches)) {
+      q <- rlnorm(1, meanlog = 0, sdlog = batch_sigma)
+      for (k in seq_len(deals_per_batch)) {
+        m <- sample_deal_seed(pbins, q)
+        type <- assign_outcome_bucket(m)
+        t <- sample_event_time(type, exit_params)
+        deal_types[idx] <- type
+        t_event[idx] <- t
+        M_final[idx] <- m
+        y_event[idx] <- year_index_from_time(t)
+        idx <- idx + 1
+      }
+    }
+
+    # Cashflows by year (gross, before carry-mode adjustment)
+    cash_gross_by_year <- numeric(horizon_years + 1)
+    cash_net_by_year <- numeric(horizon_years + 1) # used only for per_deal carry mode
+    marks_gross_by_year <- numeric(horizon_years + 1) # includes mark haircuts + smoothing
+
+    for (i in seq_len(n_deals_total)) {
+      # Marks path (haircut + smoothing applied inside mark_trajectory).
+      m_path <- mark_trajectory(M_final[i], t_event[i], horizon_years, mark_params)
+      y_exit <- y_event[i]
+      if (y_exit <= horizon_years) {
+        # After exit, value is distributed as cash, not a mark.
+        m_path[(y_exit + 1):(horizon_years + 1)] <- 0
+        cash_gross_by_year[y_exit + 1] <- cash_gross_by_year[y_exit + 1] + M_final[i]
+
+        # Per-deal carry approximation: apply carry at realization on that deal.
+        profit_i <- max(M_final[i] - 1 - fee$hurdle, 0)
+        net_i <- M_final[i] - fee$carry * profit_i
+        cash_net_by_year[y_exit + 1] <- cash_net_by_year[y_exit + 1] + net_i
+      }
+      marks_gross_by_year <- marks_gross_by_year + m_path
+    }
+
+    # DPI/TVPI value series depending on carry mode.
+    if (carry_mode == "per_deal") {
+      cash_cum_net <- cumsum(cash_net_by_year)
+      dpi_value_by_year <- cash_cum_net
+      tvpi_value_by_year <- cash_cum_net + marks_gross_by_year
+    } else {
+      cash_cum <- cumsum(cash_gross_by_year)
+
+      tvpi_value_by_year <- numeric(horizon_years + 1)
+      dpi_value_by_year <- numeric(horizon_years + 1)
+      for (yy in 0:horizon_years) {
+        gross_total_yy <- cash_cum[yy + 1] + marks_gross_by_year[yy + 1]
+        profit_total <- max(gross_total_yy - contributed_total * (1 + fee$hurdle), 0)
+        carry_fee_total <- fee$carry * profit_total
+        tvpi_value_by_year[yy + 1] <- gross_total_yy - carry_fee_total
+
+        gross_cash_yy <- cash_cum[yy + 1]
+        profit_cash <- max(gross_cash_yy - contributed_total * (1 + fee$hurdle), 0)
+        carry_fee_cash <- fee$carry * profit_cash
+        dpi_value_by_year[yy + 1] <- gross_cash_yy - carry_fee_cash
+      }
+    }
+
+    dpi[s, ] <- dpi_value_by_year / paid_in_total
+    tvpi[s, ] <- tvpi_value_by_year / paid_in_total
+
+    realized_fraction[s, ] <- vapply(0:horizon_years, \(yy) mean(y_event <= yy), numeric(1))
+
+    # IRR: annual cashflows (paid-in at year 0, cash exits at event years); terminal marks at horizon for TVPI-IRR.
+    cfs_dpi <- numeric(horizon_years + 1)
+    cfs_tvpi <- numeric(horizon_years + 1)
+    cfs_dpi[1] <- -paid_in_total
+    cfs_tvpi[1] <- -paid_in_total
+    if (carry_mode == "per_deal") {
+      cfs_dpi[2:(horizon_years + 1)] <- cash_net_by_year[2:(horizon_years + 1)]
+      cfs_tvpi[2:(horizon_years + 1)] <- cash_net_by_year[2:(horizon_years + 1)]
+    } else {
+      # For whole-fund carry, we keep a simple gross cashflow IRR proxy (carry timing/waterfall not explicitly modeled).
+      cfs_dpi[2:(horizon_years + 1)] <- cash_gross_by_year[2:(horizon_years + 1)]
+      cfs_tvpi[2:(horizon_years + 1)] <- cash_gross_by_year[2:(horizon_years + 1)]
+    }
+    cfs_tvpi[horizon_years + 1] <- cfs_tvpi[horizon_years + 1] + marks_gross_by_year[horizon_years + 1]
+
+    irr_dpi[s] <- irr_from_cashflows(cfs_dpi)
+    irr_tvpi[s] <- irr_from_cashflows(cfs_tvpi)
+
+    exit_counts[[s]] <- table(factor(deal_types, levels = c("dead", "exit_small", "exit_medium", "exit_big", "unicorn")))
+  }
+
+  exit_count_by_type <- Reduce(`+`, exit_counts) / sims
+
+  list(
+    dpi = dpi,
+    tvpi = tvpi,
+    irr_dpi = irr_dpi,
+    irr_tvpi = irr_tvpi,
+    realized_fraction = realized_fraction,
+    exit_count_by_type = exit_count_by_type
+  )
+}
+```
+
+```{r}
+#| label: figs-dpi-tvpi
+#| fig-cap: "DPI vs TVPI over time (median and 10/90 bands). TVPI uses conservative marks with haircut."
+
+set.seed(params$seed + 2)
+
+timeline_run <- simulate_multi_batch_timeline(
+  n_batches = 4,
+  deals_per_batch = n_deals,
+  sims = sims,
+  pbins = pbins_seed,
+  batch_sigma = batch_sigma,
+  fee = fees_seed,
+  horizon_years = horizon_years,
+  exit_params = exit_params,
+  mark_params = mark_params,
+  carry_mode = "whole_fund"
+)
+
+traj_summ <- function(mat, label) {
+  years <- 0:horizon_years
+  tibble(
+    year = years,
+    metric = label,
+    p10 = apply(mat, 2, quantile, probs = 0.10, type = 8),
+    p50 = apply(mat, 2, quantile, probs = 0.50, type = 8),
+    p90 = apply(mat, 2, quantile, probs = 0.90, type = 8)
+  )
+}
+
+traj <- bind_rows(
+  traj_summ(timeline_run$dpi, "DPI (exits-only)"),
+  traj_summ(timeline_run$tvpi, glue("TVPI (exits + marks, haircut={percent(mark_params$haircut)})"))
+)
+
+ggplot(traj, aes(x = year, y = p50, colour = metric, fill = metric)) +
+  geom_ribbon(aes(ymin = p10, ymax = p90), alpha = 0.12, colour = NA) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 1, linetype = "dashed", alpha = 0.5) +
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.1)) +
+  labs(x = "Years since initial investment", y = "Net multiple (x)", colour = NULL, fill = NULL) +
+  theme_minimal()
+```
+
+```{r}
+#| label: figs-realization
+#| fig-cap: "Realization (cash-out) over time: fraction of deals with an outcome by year"
+
+rf <- timeline_run$realized_fraction
+rf_df <- tibble(
+  year = 0:horizon_years,
+  p10 = apply(rf, 2, quantile, probs = 0.10, type = 8),
+  p50 = apply(rf, 2, quantile, probs = 0.50, type = 8),
+  p90 = apply(rf, 2, quantile, probs = 0.90, type = 8)
+)
+
+ggplot(rf_df, aes(x = year, y = p50)) +
+  geom_ribbon(aes(ymin = p10, ymax = p90), alpha = 0.12, fill = "steelblue") +
+  geom_line(linewidth = 1, colour = "steelblue") +
+  scale_y_continuous(labels = scales::label_percent()) +
+  labs(x = "Years since initial investment", y = "Fraction realized (cash exits)", caption = "Realized fraction counts deals with an event time <= year.") +
+  theme_minimal()
+```
+
+```{r}
+#| label: sensitivity-tables
+
+summ_horizon <- function(run, horizon_years) {
+  dpi_T <- run$dpi[, horizon_years + 1]
+  tvpi_T <- run$tvpi[, horizon_years + 1]
+  irr_T <- run$irr_tvpi
+  realized_T <- run$realized_fraction[, horizon_years + 1]
+  tibble(
+    Mean_TVPI = mean(tvpi_T, na.rm = TRUE),
+    Median_TVPI = median(tvpi_T, na.rm = TRUE),
+    `P(TVPI<1x)` = mean(tvpi_T < 1, na.rm = TRUE),
+    `P(TVPI>2x)` = mean(tvpi_T > 2, na.rm = TRUE),
+    `P(TVPI>5x)` = mean(tvpi_T > 5, na.rm = TRUE),
+    DPI_T = median(dpi_T, na.rm = TRUE),
+    TVPI_T = median(tvpi_T, na.rm = TRUE),
+    IRR_T = median(irr_T, na.rm = TRUE),
+    RealizedPct_T = median(realized_T, na.rm = TRUE)
+  )
+}
+
+run_sensitivity <- function(sigmas, haircuts, n_batches = 4, sims_sens = 5000) {
+  grid <- tidyr::crossing(batch_sigma = sigmas, haircut_mode = haircuts)
+  res <- pmap_dfr(grid, \(batch_sigma, haircut_mode) {
+    mp <- mark_params
+    mp$haircut <- unname(haircut_map[[haircut_mode]])
+    set.seed(params$seed + round(batch_sigma * 100) + match(haircut_mode, names(haircut_map)) * 1000)
+    run <- simulate_multi_batch_timeline(
+      n_batches = n_batches,
+      deals_per_batch = n_deals,
+      sims = sims_sens,
+      pbins = pbins_seed,
+      batch_sigma = batch_sigma,
+      fee = fees_seed,
+      horizon_years = horizon_years,
+      exit_params = exit_params,
+      mark_params = mp,
+      carry_mode = "whole_fund"
+    )
+    summ <- summ_horizon(run, horizon_years)
+    summ |>
+      mutate(batch_sigma = batch_sigma, haircut_mode = haircut_mode, n_batches = n_batches) |>
+      relocate(n_batches, batch_sigma, haircut_mode)
+  })
+  res
+}
+
+sens <- run_sensitivity(
+  sigmas = sigma_grid,
+  haircuts = c("base", "conservative", "stress"),
+  n_batches = 4,
+  sims_sens = 5000
+) |>
+  mutate(
+    Mean_TVPI = round(Mean_TVPI, 2),
+    Median_TVPI = round(Median_TVPI, 2),
+    DPI_T = round(DPI_T, 2),
+    TVPI_T = round(TVPI_T, 2),
+    IRR_T = percent(IRR_T, accuracy = 0.1),
+    RealizedPct_T = percent(RealizedPct_T, accuracy = 0.1),
+    `P(TVPI<1x)` = percent(`P(TVPI<1x)`, accuracy = 0.1),
+    `P(TVPI>2x)` = percent(`P(TVPI>2x)`, accuracy = 0.1),
+    `P(TVPI>5x)` = percent(`P(TVPI>5x)`, accuracy = 0.1)
+  ) |>
+  mutate(haircut_mode = case_match(haircut_mode, "base" ~ "base", "conservative" ~ "cons", "stress" ~ "stress", .default = haircut_mode)) |>
+  rename(
+    Batches = n_batches,
+    `σ` = batch_sigma,
+    Haircut = haircut_mode,
+    Mean = Mean_TVPI,
+    Median = Median_TVPI,
+    `P(<1x)` = `P(TVPI<1x)`,
+    `P(>2x)` = `P(TVPI>2x)`,
+    `P(>5x)` = `P(TVPI>5x)`,
+    DPI = DPI_T,
+    TVPI = TVPI_T,
+    IRR = IRR_T,
+    `Real%` = RealizedPct_T
+  )
+
+knitr::kable(
+  sens,
+  caption = glue("Sensitivity at {horizon_years}y horizon (4 batches × {n_deals} deals). TVPI uses mark haircuts per mode; carry at fund level. Exit-time: scale exit_params$medians and re-run run_sensitivity()."),
+  align = c("r", "r", "l", "r", "r", "r", "r", "r", "r", "r", "r", "r")
+)
+```
+
+```{r}
+#| label: fig-density-dpi-tvpi
+#| fig-cap: "Distribution at horizon: DPI vs TVPI (net multiples)"
+
+h <- horizon_years + 1
+df_ht <- tibble(
+  DPI = timeline_run$dpi[, h],
+  TVPI = timeline_run$tvpi[, h]
+)
+
+ggplot(df_ht, aes(x = TVPI, fill = "TVPI")) +
+  geom_density(alpha = 0.30) +
+  geom_density(aes(x = DPI, fill = "DPI"), alpha = 0.30) +
+  geom_vline(xintercept = 1, linetype = "dashed", alpha = 0.5) +
+  coord_cartesian(xlim = c(0, quantile(df_ht$TVPI, 0.98, na.rm = TRUE))) +
+  scale_fill_manual(values = c(DPI = "darkorange", TVPI = "steelblue")) +
+  labs(x = glue("Net multiple at {horizon_years}y (x)"), y = "Density", fill = NULL) +
+  theme_minimal()
+```
+
+## Limitations (read before using the numbers)
+
+- **Demo Day Fund proxy mismatch**: AngelList Demo Day Fund MOICs are a **proxy** for the YC batch opportunity set and a specific vehicle’s implementation, not a direct measure of “invest \$X into every YC company in the batch at seed.” Portfolio construction, check sizing, access, and selection are all different.
+- **Marks are not cash**: TVPI depends on private marks that can be stale and subjective. We explicitly haircut marks using public secondary-market anchors, but the “right” haircut is unobservable and regime-dependent.
+- **Preferences / dilution / structure**: this model uses a MOIC proxy and does not explicitly model liquidation preferences, participating preferred, option pool refreshes, down-round structure, or dilution path. Heyman’s DPI chart notes “net of dilution” in his discussion; we do not explicitly model that term here.
+- **Carry math**: carry is typically computed at the **fund level**. We provide both a per-deal approximation and a fund-level approximation, but both remain simplified versus real waterfall mechanics and timing of distributions.
+- **Selection / survivorship bias**: public datasets overrepresent visible successes; failure identification can be noisy (see CB Insights discussion of “quiet burials” and zombie companies). Source for death-timing context: `https://www.cbinsights.com/research/Startup-death-data/`
+
 ## Appendix: Batch quality model
 
 We model the batch effect as a **log-normal multiplier** applied to each deal's gross MOIC within a batch. A batch quality factor $q$ is drawn once per batch:
@@ -279,7 +888,7 @@ $$q \sim \text{LogNormal}(\mu = 0, \sigma)$$
 
 so the median batch has $q = 1$ (no shift), while better/worse batches scale outcomes up/down. The parameter $\sigma$ controls the spread of batch quality.
 
-We calibrate $\sigma$ to approximately reproduce the observed batch-to-batch MOIC spread in the AngelList DDF data. The log standard deviation of the mature batch MOICs is `r round(sd(log(ddf_moics)), 2)`. However, this reflects both batch effects *and* within-batch sampling noise. The pure batch effect $\sigma$ should be somewhat smaller. We use $\sigma = 0.7$ as a reasonable estimate.
+We calibrate $\sigma$ by matching the distribution of observed AngelList DDF batch MOICs, explicitly allowing for **measurement / vehicle noise** on top of within-batch sampling noise. The selected `batch_sigma` above is `r round(batch_sigma, 2)` with a best-fit measurement-noise proxy `sigma_meas ≈ r round(sigma_meas_hat, 2)`.
 
 ```{r}
 #| label: batch-quality-quantiles
